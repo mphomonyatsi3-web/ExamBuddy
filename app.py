@@ -4,253 +4,179 @@ import streamlit as st
 from PIL import Image
 from pypdf import PdfReader
 
-from core import clean_text, extract_topics, build_study_sheet
+from core import clean_text, extract_topics, build_document_overview, build_topic_sheet_with_pages
 
-# ---------------------------
-# App config (RENAMED)
-# ---------------------------
 st.set_page_config(page_title="ExamBuddy", page_icon="📚", layout="wide")
 
-# ---------------------------
-# Safety / limits
-# ---------------------------
-MAX_PDF_MB = 20          # per file
-MAX_IMAGE_MB = 8         # per file
-MAX_TOTAL_MB = 40        # combined (soft limit)
-MAX_PDF_PAGES = 80       # per PDF (avoid huge books freezing)
-MAX_TEXT_CHARS = 250_000 # cap text to keep app responsive
-
-UNSAFE_HINTS = [
-    # Study-only safety blocklist (keep short, broad)
-    "suicide", "kill myself", "self harm", "harm myself",
-    "make a bomb", "how to make a bomb", "poison", "how to poison",
-    "how to hurt", "hurt someone", "weapon instructions"
-]
-
+# --- Safety / privacy (Option A) ---
+UNSAFE_HINTS = ["suicide", "kill myself", "self harm", "make a bomb", "poison", "how to hurt", "weapon instructions"]
 def is_unsafe(text: str) -> bool:
     t = (text or "").lower()
     return any(x in t for x in UNSAFE_HINTS)
 
-def mb(n_bytes: int) -> float:
-    return n_bytes / (1024 * 1024)
+MAX_PDF_PAGES = 120
+MAX_TEXT_CHARS = 280_000
 
-# ---------------------------
-# Helpers: PDF + optional OCR
-# ---------------------------
-def extract_text_from_pdf(file_bytes: bytes) -> str:
+# --- PDF extraction: page-aware ---
+def extract_pages_from_pdf(file_bytes: bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
-    chunks = []
+    pages = []
+    total = len(reader.pages)
 
-    num_pages = len(reader.pages)
-    if num_pages > MAX_PDF_PAGES:
-        st.warning(f"PDF has {num_pages} pages. For safety/performance, only the first {MAX_PDF_PAGES} pages will be processed.")
-        pages = reader.pages[:MAX_PDF_PAGES]
+    if total > MAX_PDF_PAGES:
+        st.warning(f"PDF has {total} pages. For performance, only first {MAX_PDF_PAGES} pages are processed.")
+        page_objs = reader.pages[:MAX_PDF_PAGES]
     else:
-        pages = reader.pages
+        page_objs = reader.pages
 
-    for page in pages:
+    for idx, page in enumerate(page_objs, start=1):
         t = page.extract_text() or ""
-        if t.strip():
-            chunks.append(t)
+        t = clean_text(t)
+        if t:
+            pages.append({"page": idx, "text": t})
+    return pages
 
-    return clean_text("\n\n".join(chunks))
-
+# --- Optional OCR (if installed) ---
 def try_ocr_image(pil_img: Image.Image) -> str:
-    """
-    Optional OCR. Works only if pytesseract + Tesseract installed.
-    If not installed, returns "" gracefully.
-    """
     try:
         import pytesseract  # noqa
     except Exception:
         return ""
-
     try:
         text = pytesseract.image_to_string(pil_img)
         return clean_text(text)
     except Exception:
         return ""
 
-# ---------------------------
-# Sidebar: safety + controls
-# ---------------------------
+# --- Sidebar ---
 st.sidebar.title("📚 ExamBuddy")
 safe_mode = st.sidebar.toggle("Safe mode", value=True)
 
-st.sidebar.markdown("### Safety")
 st.sidebar.info(
-    "ExamBuddy is **study-only**: it helps explain school content and generate practice.\n\n"
-    "It’s **not** a doctor/therapist/lawyer, and it won’t help with harmful topics.\n\n"
-    "Uploads are processed **in-session** (not intentionally saved)."
+    "Study-only. Not professional advice.\n\n"
+    "Privacy Mode (Option A): files are processed in-session and not intentionally saved."
 )
 
-if st.sidebar.button("🧹 Clear session (remove loaded content)"):
+if st.sidebar.button("🧹 Clear session"):
     for k in list(st.session_state.keys()):
         del st.session_state[k]
     st.rerun()
 
-st.sidebar.markdown("### Limits")
-st.sidebar.write(
-    f"- PDF per file: up to **{MAX_PDF_MB}MB**\n"
-    f"- Image per file: up to **{MAX_IMAGE_MB}MB**\n"
-    f"- PDF pages processed: up to **{MAX_PDF_PAGES} pages**\n"
-)
-
-with st.sidebar.expander("🔧 Optional: Enable OCR for images"):
-    st.write(
-        "Images (scans/photos) need OCR to extract text.\n\n"
-        "If you want that feature:\n"
-        "1) Install Tesseract OCR\n"
-        "2) Run: `pip install pytesseract`\n\n"
-        "Then image uploads will contribute text."
-    )
-
-# ---------------------------
-# Main UI
-# ---------------------------
+# --- Main UI ---
 st.title("📚 ExamBuddy")
-st.caption("Upload exam papers/textbooks (PDF) and optionally images. Pick a topic. Get summaries, simplified explanations, and practice questions — no API keys needed.")
+st.caption("Upload PDFs (exam papers/textbooks). Get a document overview, topic explanations, and exam questions — no API keys.")
 
-colA, colB = st.columns([1, 1])
+mode = st.radio("Choose a mode:", ["Document Overview", "Topic Deep Dive", "Exam Questions"], horizontal=True)
 
-with colA:
-    st.subheader("1) Upload your files")
-    pdf_files = st.file_uploader(
-        "Upload PDFs (exam papers / textbooks)",
-        type=["pdf"],
-        accept_multiple_files=True
-    )
-    img_files = st.file_uploader(
-        "Upload images (optional, scanned pages)",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True
-    )
+pdf_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+img_files = st.file_uploader("Upload images (optional, scanned pages)", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
 
-with colB:
-    st.subheader("2) Study settings")
-    topic_mode = st.radio(
-        "How do you want to choose a topic?",
-        ["Auto-suggest topics", "Type my own topic"],
-        horizontal=True
-    )
-    max_topics = st.slider("How many topic suggestions?", 5, 40, 20)
+if not pdf_files and not img_files:
+    st.stop()
 
-st.divider()
-
-# ---------------------------
-# Validate sizes + build one text blob
-# ---------------------------
+# --- Build pages + combined text (Option A: no saving to disk) ---
+all_pages = []
 all_text = ""
-total_mb = 0.0
 
-# PDFs
 if pdf_files:
     for f in pdf_files:
         data = f.read()
-        size_mb = mb(len(data))
-        total_mb += size_mb
+        pages = extract_pages_from_pdf(data)
+        all_pages.extend(pages)
+        all_text += "\n\n" + "\n\n".join(p["text"] for p in pages)
 
-        if size_mb > MAX_PDF_MB:
-            st.error(f"PDF '{f.name}' is {size_mb:.1f}MB (limit {MAX_PDF_MB}MB). Please upload a smaller file.")
-            st.stop()
-
-        all_text += "\n\n" + extract_text_from_pdf(data)
-
-# Images (optional OCR)
 if img_files:
     for f in img_files:
-        data = f.read()
-        size_mb = mb(len(data))
-        total_mb += size_mb
-
-        if size_mb > MAX_IMAGE_MB:
-            st.error(f"Image '{f.name}' is {size_mb:.1f}MB (limit {MAX_IMAGE_MB}MB). Please upload a smaller image.")
-            st.stop()
-
-        img = Image.open(io.BytesIO(data)).convert("RGB")
+        img = Image.open(f).convert("RGB")
         ocr_text = try_ocr_image(img)
         if ocr_text:
+            # treat OCR text as "page 0"
+            all_pages.append({"page": 0, "text": ocr_text})
             all_text += "\n\n" + ocr_text
 
-if total_mb > MAX_TOTAL_MB:
-    st.warning(f"Total upload size is {total_mb:.1f}MB. If the app feels slow, upload fewer/smaller files.")
-
 all_text = clean_text(all_text)
-
-# Cap text length (performance + safety)
 if len(all_text) > MAX_TEXT_CHARS:
-    st.warning("Your content is very large. For performance, ExamBuddy will only use the first part of the extracted text.")
+    st.warning("Large content detected. Using only the first part for performance.")
     all_text = all_text[:MAX_TEXT_CHARS]
 
 if not all_text:
-    st.warning("Upload at least one PDF to begin (images only add text if OCR is installed).")
+    st.warning("No text extracted. If your PDF is scanned, enable OCR (optional).")
     st.stop()
 
-# ---------------------------
-# Topic selection
-# ---------------------------
-topics = extract_topics(all_text, top_n=max_topics)
+# --- Mode 1: Document Overview (like my explanation) ---
+if mode == "Document Overview":
+    overview = build_document_overview(all_pages)
 
-chosen_topic = ""
-if topic_mode == "Auto-suggest topics":
-    if topics:
-        labels = [f"{w}  ({c})" for w, c in topics]
-        picked = st.selectbox("Pick a suggested topic", labels, index=0)
-        chosen_topic = picked.split("  (")[0].strip()
+    st.subheader("✅ What this document is about (simple)")
+    for s in overview["what_it_is"]:
+        st.write("• " + s)
+
+    st.subheader("📌 Main sections (auto-detected)")
+    if overview["headings"]:
+        for h in overview["headings"]:
+            st.write(f"• {h['heading']}  — Page {h['page']}")
     else:
-        chosen_topic = st.text_input("No topics detected — type a topic:", value="")
-else:
-    chosen_topic = st.text_input("Type your topic (e.g. 'probability', 'photosynthesis', 'supply and demand')", value="")
+        st.write("No headings detected. (Some PDFs hide headings in images.)")
 
-# Safety gate
-if safe_mode and is_unsafe(chosen_topic):
-    st.error("This topic is blocked by Safe Mode. Please choose a school-related topic.")
-    st.stop()
+    st.subheader("🧠 Key terms (most common)")
+    st.write(", ".join(overview["key_terms"][:15]))
 
-if not chosen_topic.strip():
-    st.info("Type or pick a topic to generate your study sheet.")
-    st.stop()
+    st.divider()
+    st.caption("Tip: Switch to **Topic Deep Dive** to explain one concept properly.")
 
-# ---------------------------
-# Generate the “study sheet”
-# ---------------------------
-sheet = build_study_sheet(all_text, chosen_topic)
+# --- Mode 2 + 3 need a topic ---
+topics = extract_topics(all_text, top_n=25)
+labels = [f"{w} ({c})" for w, c in topics] if topics else []
+topic = ""
 
-left, right = st.columns([1.15, 0.85])
+if mode in ["Topic Deep Dive", "Exam Questions"]:
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if labels:
+            picked = st.selectbox("Pick a topic (suggested)", labels, index=0)
+            topic = picked.split(" (")[0].strip()
+        else:
+            topic = st.text_input("Type your topic", value="")
+    with col2:
+        topic = st.text_input("Or type a custom topic", value=topic)
 
-with left:
-    st.subheader(f"✅ Study Sheet: {sheet['topic']}")
+    if safe_mode and is_unsafe(topic):
+        st.error("Blocked by Safe Mode. Choose a school-related topic.")
+        st.stop()
 
-    st.markdown("### Summary")
-    for s in sheet["summary"]:
-        st.write("• " + s)
+    if not topic.strip():
+        st.stop()
 
-    st.markdown("### Simplified explanation (easy version)")
-    for s in sheet["simple_explanation"]:
-        st.write("• " + s)
+    sheet = build_topic_sheet_with_pages(all_pages, topic)
 
-    st.markdown("### Key terms to remember")
-    st.write(", ".join(sheet["key_terms"]) if sheet["key_terms"] else "—")
+    if mode == "Topic Deep Dive":
+        st.subheader(f"✅ Topic Deep Dive: {sheet['topic']}")
 
-with right:
-    st.subheader("🧠 Practice")
-    for i, q in enumerate(sheet["practice_questions"], start=1):
-        with st.expander(f"{i}. ({q['type']}) {q['question'][:60]}{'...' if len(q['question'])>60 else ''}"):
-            st.write(q["question"])
-            st.caption(q["answer_hint"])
+        st.markdown("### Summary")
+        for s in sheet["summary"]:
+            st.write("• " + s)
 
-    st.markdown("### Download")
-    safe_filename = re.sub(r"[^a-zA-Z0-9_\-]+", "_", sheet["topic"]).strip("_")[:40] or "topic"
-    st.download_button(
-        "Download study sheet (TXT)",
-        data=(
-            f"APP: ExamBuddy\n"
-            f"TOPIC: {sheet['topic']}\n\n"
-            "SUMMARY:\n" + "\n".join("- " + s for s in sheet["summary"]) + "\n\n"
-            "SIMPLIFIED:\n" + "\n".join("- " + s for s in sheet["simple_explanation"]) + "\n\n"
-            "KEY TERMS:\n" + ", ".join(sheet["key_terms"]) + "\n\n"
-            "PRACTICE:\n" + "\n".join(f"{idx}. {q['question']} ({q['type']})" for idx, q in enumerate(sheet["practice_questions"], start=1))
-        ),
-        file_name=f"exambuddy_{safe_filename}.txt",
-        mime="text/plain"
-    )
+        st.markdown("### Simplified explanation (easy version)")
+        for s in sheet["simple_explanation"]:
+            st.write("• " + s)
+
+        st.markdown("### Key terms")
+        st.write(", ".join(sheet["key_terms"]) if sheet["key_terms"] else "—")
+
+        st.markdown("### Where this came from (page hints)")
+        for c in sheet["citations"]:
+            pg = c["page"]
+            tag = f"Page {pg}" if pg != 0 else "Image OCR"
+            st.write(f"• **{tag}**: {c['sentence']}")
+
+    if mode == "Exam Questions":
+        st.subheader(f"📝 Exam Questions: {sheet['topic']}")
+        for i, q in enumerate(sheet["exam_questions"], start=1):
+            st.write(f"{i}. {q}")
+
+        st.download_button(
+            "Download questions (TXT)",
+            data="\n".join(f"{i}. {q}" for i, q in enumerate(sheet["exam_questions"], start=1)),
+            file_name=f"exambuddy_questions_{re.sub(r'[^a-zA-Z0-9]+','_',topic)[:40]}.txt",
+            mime="text/plain",
+        )
